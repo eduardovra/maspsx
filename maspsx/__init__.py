@@ -566,7 +566,7 @@ class MaspsxProcessor:
                         current_symbol = line.replace(":", "")
                         self.sdata_entries[current_symbol] = 0
                     else:
-                        if line.startswith(".type"):
+                        if line.startswith(".type") or line.startswith(".stab"):
                             continue
 
                         if line.startswith(".space"):
@@ -647,8 +647,8 @@ class MaspsxProcessor:
                     elif size >= 2:
                         res.append("\t.align 1")
 
-                # only mark bss symbols as global
-                if section == "bss":
+                # .comm symbols are global in C; .lcomm (static) ones stay local
+                if section == "bss" or symbol in self.comm_symbols:
                     res.append(
                         f"\t.globl {symbol}",
                     )
