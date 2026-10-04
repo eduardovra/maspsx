@@ -616,6 +616,11 @@ class MaspsxProcessor:
                     in_include_asm_hack = False
                 continue
 
+            if "__maspsx_include_asm_hack" in line and "# maspsx-keep" not in line:
+                # debug stabs gcc emits after the hack function's .end
+                res += [f"# {line} # DEBUG: skipped include asm hack stab"]
+                continue
+
             if is_instruction(line) and self.skip_instructions > 0:
                 self.skip_instructions -= 1
                 res += [f"# {line}  # DEBUG: skipped"]
