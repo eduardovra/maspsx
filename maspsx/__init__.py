@@ -283,6 +283,9 @@ def is_label(line: str):
 
 
 def is_instruction(line: str, ignore_nop=False, ignore_set=False, ignore_label=False):
+    if re.match(r"^\$LM\d+:$", line.strip()):
+        # -g line-number labels are not branch targets; look past them for hazards
+        return False
     if len(line) == 0:
         return False
 
