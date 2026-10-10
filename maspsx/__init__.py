@@ -467,6 +467,7 @@ class MaspsxProcessor:
         use_comm_section=False,
         use_comm_for_lcomm=False,
         max_comm_alignment=16,
+        gp_externs=(),
     ):
         self.lines = [x.strip() for x in lines]
 
@@ -489,6 +490,7 @@ class MaspsxProcessor:
         self.use_comm_section = use_comm_section
         self.use_comm_for_lcomm = use_comm_for_lcomm
         self.max_comm_alignment = max_comm_alignment
+        self.gp_externs = set(gp_externs)
 
         self.bss_entries: dict[str, int] = {}
         self.sbss_entries: dict[str, int] = {}
@@ -688,6 +690,13 @@ class MaspsxProcessor:
 
         return ""  # warn user?
 
+    def _is_small_data(self, symbol: str) -> bool:
+        return (
+            symbol in self.sdata_entries
+            or symbol in self.sbss_entries
+            or symbol in self.gp_externs
+        )
+
     def _uses_gp(self, line: str) -> bool:
         if self.sdata_limit == 0:
             return False
@@ -711,9 +720,7 @@ class MaspsxProcessor:
                     symbol = operand
                     gp_allowed = True
 
-                if gp_allowed and (
-                    symbol in self.sbss_entries or symbol in self.sdata_entries
-                ):
+                if gp_allowed and self._is_small_data(symbol):
                     return True
 
         return False
@@ -1012,9 +1019,7 @@ class MaspsxProcessor:
                     gp_rel = f"%gp_rel({symbol})($gp)"
                     gp_allowed = True
 
-                if gp_allowed and (
-                    symbol in self.sdata_entries or symbol in self.sbss_entries
-                ):
+                if gp_allowed and self._is_small_data(symbol):
                     res.append(f"{op}\t{r_dest},{gp_rel}")
                 else:
                     res.append(line)
@@ -1103,9 +1108,7 @@ class MaspsxProcessor:
                 if op == "la" and not self.gp_allow_la:
                     gp_allowed = False
 
-                if gp_allowed and (
-                    symbol in self.sdata_entries or symbol in self.sbss_entries
-                ):
+                if gp_allowed and self._is_small_data(symbol):
                     res.append(f"{op}\t{r_dest},{gp_rel}")
                 else:
                     res.append(line)
