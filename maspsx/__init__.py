@@ -861,7 +861,7 @@ class MaspsxProcessor:
                             )
                             res.append(".set\tnoreorder")
                             res.append(expand_move(inst))
-                        elif uses_at(inst):
+                        elif uses_at(inst) and not inst.startswith("lui\t"):
                             # a symbolic load/store expands to lui/addu/op
                             # through $at, which covers the hazard
                             res.extend(

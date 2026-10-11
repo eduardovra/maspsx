@@ -342,6 +342,29 @@ class TestDivExpansion(unittest.TestCase):
         clean_lines = strip_comments(res)
         self.assertEqual(expected_lines, clean_lines[:5])
 
+    def test_nop_mfhi_lui_mult(self):
+        """
+        A lui of a %hi() is one instruction, so a nop must still separate
+        the mfhi from the mult
+        """
+        lines = [
+            "	mfhi	$8",
+            "	#nop",
+            "	lui	$5,%hi(D_8007B5FC) # high",
+            "	mult	$2,$3",
+        ]
+        expected_lines = [
+            "mfhi\t$8",
+            "lui\t$5,%hi(D_8007B5FC)",
+            "nop",
+            "mult\t$2,$3",
+        ]
+        mp = MaspsxProcessor(lines)
+        res = mp.process_lines()
+
+        clean_lines = strip_comments(res)
+        self.assertEqual(expected_lines, clean_lines[:4])
+
     def test_simple_div_expansion_nop(self):
         """
         We need to handle loads/stores from registers used immediately after mflo/mfhi
