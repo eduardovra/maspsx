@@ -1,7 +1,7 @@
 import struct
 import re
 
-from typing import List
+from enum import Enum
 
 branch_mnemonics = {
     "beq",
@@ -70,6 +70,25 @@ double_reg_loads = {
     "slti",
     "sltu",
 }
+
+
+class LcommAlignment(Enum):
+    # Packed right after the previous symbol
+    NONE = "none"
+    # Aligned to 4, size rounded up to a multiple of 4
+    WORD = "word"
+    # Aligned to the size rounded up to a power of two, at most 16
+    POWER_OF_TWO = "power_of_two"
+
+    def layout(self, size: int) -> tuple[int, int]:
+        """Return the alignment and allocated size of a `.lcomm` symbol."""
+        if self == LcommAlignment.WORD:
+            return 4, (size + 3) & ~3
+
+        if self == LcommAlignment.POWER_OF_TWO and size > 1:
+            return min(1 << (size - 1).bit_length(), 16), size
+
+        return 1, size
 
 
 def strip_comments(line: str) -> str:
@@ -237,7 +256,7 @@ def div_needs_expanding(line: str) -> bool:
     return r_dest not in ("$zero", "$0")
 
 
-def expand_load_immediate(line: str) -> List[str]:
+def expand_load_immediate(line: str, li_small_uses_addiu=False) -> list[str]:
     res = []
 
     match = re.match(r"li\s+(\$[0-9A-z]+),\s?(-?[x0-9a-fA-F]+)", line)
@@ -246,7 +265,10 @@ def expand_load_immediate(line: str) -> List[str]:
     r_dest = match.group(1)
     operand = int(match.group(2), 0)
 
-    if 0 < operand < 0x10000:
+    if 0 <= operand <= 0x7FFF:
+        inst = "addiu" if li_small_uses_addiu else "ori"
+        res.append(f"{inst}\t{r_dest},$zero,{operand}")
+    elif 0 < operand < 0x10000:
         res.append(f"ori\t{r_dest},$zero,{operand}")
     elif operand >= 0x10000:
         res.append(f"lui\t{r_dest},({operand} >> 16) & 0xFFFF")
@@ -256,14 +278,10 @@ def expand_load_immediate(line: str) -> List[str]:
         res.append(f"addiu\t{r_dest},$zero,{operand}")
     elif operand == -0x8000:
         res.append(f"addiu\t{r_dest},$zero,{operand} & 0xFFFF")
-    elif operand < -0x8000:
+    else:  # operand < -0x8000
         res.append(f"lui\t{r_dest},({operand} >> 16) & 0xFFFF")
         if operand & 0xFFFF:
             res.append(f"ori\t{r_dest},{r_dest},{operand} & 0xFFFF")
-    else:
-        # TODO: raise an exception here instead?
-        # ori is actually addiu on ASPSX 2.56+
-        res.append(f"ori\t{r_dest},0")
 
     return res
 
@@ -424,10 +442,10 @@ def is_coff_directive(line: str):
 
 class PassthroughProcessor:
 
-    def __init__(self, lines: List[str]):
+    def __init__(self, lines: list[str]):
         self.lines = [x.strip() for x in lines]
 
-    def process_lines(self) -> List[str]:
+    def process_lines(self) -> list[str]:
         res = []
 
         for line in self.lines:
@@ -452,7 +470,7 @@ class MaspsxProcessor:
 
     def __init__(
         self,
-        lines: List[str],
+        lines: list[str],
         sdata_limit=0,
         expand_div=False,
         expand_li=False,
@@ -468,6 +486,10 @@ class MaspsxProcessor:
         use_comm_for_lcomm=False,
         max_comm_alignment=16,
         gp_externs=(),
+        lcomm_alignment=LcommAlignment.WORD,
+        comm_uses_sdata_limit=True,
+        gp_allow=True,
+        li_small_uses_addiu=False,
     ):
         self.lines = [x.strip() for x in lines]
 
@@ -475,6 +497,7 @@ class MaspsxProcessor:
 
         self.expand_div = expand_div
         self.expand_li = expand_li
+        self.li_small_uses_addiu = li_small_uses_addiu
 
         self.nop_at_expansion = nop_at_expansion
         self.nop_mflo_mfhi = nop_mflo_mfhi
@@ -486,11 +509,14 @@ class MaspsxProcessor:
 
         self.gp_allow_offset = gp_allow_offset
         self.gp_allow_la = gp_allow_la
+        self.gp_allow = gp_allow
 
         self.use_comm_section = use_comm_section
         self.use_comm_for_lcomm = use_comm_for_lcomm
         self.max_comm_alignment = max_comm_alignment
         self.gp_externs = set(gp_externs)
+        self.lcomm_alignment = lcomm_alignment
+        self.comm_uses_sdata_limit = comm_uses_sdata_limit
 
         self.bss_entries: dict[str, int] = {}
         self.sbss_entries: dict[str, int] = {}
@@ -548,12 +574,14 @@ class MaspsxProcessor:
                 _, var = line.split()
                 symbol, size_str, *_ = var.split(",")
                 size = int(size_str)
-                if size <= self.sdata_limit:
+                is_comm = line.startswith(".comm")
+                uses_sdata_limit = self.comm_uses_sdata_limit or not is_comm
+                if uses_sdata_limit and size <= self.sdata_limit:
                     self.sbss_entries[symbol] = size
                 else:
                     self.bss_entries[symbol] = size
 
-                if line.startswith(".comm"):
+                if is_comm:
                     self.comm_symbols.add(symbol)
                 continue
 
@@ -626,7 +654,7 @@ class MaspsxProcessor:
                 res += [f"# {line} # DEBUG: skipped include asm hack stab"]
                 continue
 
-            if is_instruction(line) and self.skip_instructions > 0:
+            if self.skip_instructions > 0 and is_instruction(line):
                 self.skip_instructions -= 1
                 res += [f"# {line}  # DEBUG: skipped"]
             else:
@@ -640,22 +668,21 @@ class MaspsxProcessor:
                 if i == 0:
                     res.append(f".section .{section}")
 
-                if self.use_comm_section and (
-                    symbol in self.comm_symbols or self.use_comm_for_lcomm
-                ):
-                    # GNU as's implicit alignment: the size rounded up to a power of two
-                    implicit_alignment = 1 << (size - 1).bit_length()
-                    alignment = min(implicit_alignment, self.max_comm_alignment)
+                alignment, padded_size = self.lcomm_alignment.layout(size)
+                is_comm_symbol = symbol in self.comm_symbols or self.use_comm_for_lcomm
+
+                if self.use_comm_section and is_comm_symbol:
+                    if symbol in self.comm_symbols:
+                        # For actual `comm` symbols, force GNU as's implicit alignment:
+                        # the size rounded up to a power of two.
+                        alignment = 1 << (size - 1).bit_length()
+
+                    alignment = min(alignment, self.max_comm_alignment)
                     res.append(f"\t.comm {symbol},{size},{alignment}")
                     continue
 
-                if section == "sbss":
-                    if size >= 8:
-                        res.append("\t.align 3")
-                    elif size >= 4:
-                        res.append("\t.align 2")
-                    elif size >= 2:
-                        res.append("\t.align 1")
+                if alignment > 1:
+                    res.append(f"\t.align {alignment.bit_length() - 1}")
 
                 # .comm symbols are global in C; .lcomm (static) ones stay local
                 if section == "bss" or symbol in self.comm_symbols:
@@ -665,7 +692,7 @@ class MaspsxProcessor:
                 res.extend(
                     [
                         f"{symbol}:",
-                        f"\t.space {size}",
+                        f"\t.space {padded_size}",
                     ]
                 )
 
@@ -698,7 +725,7 @@ class MaspsxProcessor:
         )
 
     def _uses_gp(self, line: str) -> bool:
-        if self.sdata_limit == 0:
+        if self.sdata_limit == 0 or not self.gp_allow:
             return False
 
         line = strip_comments(line)
@@ -727,8 +754,8 @@ class MaspsxProcessor:
 
     def _handle_nop_before_next_instruction(
         self, next_instruction: str, r_dest: str
-    ) -> List[str]:
-        res: List[str] = []
+    ) -> list[str]:
+        res: list[str] = []
 
         if line_loads_from_reg(next_instruction, r_dest, loads_to_reg=self.nop_lw_lw):
             nop_required = False
@@ -766,9 +793,9 @@ class MaspsxProcessor:
 
         return res
 
-    def _handle_mflo_mfhi(self, r_source=None) -> List[str]:
+    def _handle_mflo_mfhi(self, r_source=None) -> list[str]:
         # we cannot use a div/mult within 2 instructions of mflo/mfhi
-        res: List[str] = []
+        res: list[str] = []
 
         if not self.nop_mflo_mfhi:
             return res
@@ -837,7 +864,10 @@ class MaspsxProcessor:
                         break
 
                     if op == "li":
-                        expanded = expand_load_immediate(inst)
+                        expanded = expand_load_immediate(
+                            inst,
+                            self.li_small_uses_addiu,
+                        )
 
                         if self.expand_li:
                             res += expanded
@@ -1010,7 +1040,9 @@ class MaspsxProcessor:
 
             elif is_addend and r_source is None:
                 # e.g. lb	$s0,D_800E52E0
-                if operand.count("+") == 1:
+                if not self.gp_allow:
+                    gp_allowed = False
+                elif operand.count("+") == 1:
                     symbol, offset = operand.split("+")
                     gp_rel = f"%gp_rel({symbol}+{offset})($gp)"
                     gp_allowed = self.gp_allow_offset or symbol not in self.comm_symbols
@@ -1096,7 +1128,9 @@ class MaspsxProcessor:
 
             if is_addend and r_source is None:
                 # e.g. sw	$v0,D_800E52E0
-                if operand.count("+") == 1:
+                if not self.gp_allow:
+                    gp_allowed = False
+                elif operand.count("+") == 1:
                     symbol, offset = operand.split("+")
                     gp_rel = f"%gp_rel({symbol}+{offset})($gp)"
                     gp_allowed = self.gp_allow_offset or symbol not in self.comm_symbols
@@ -1162,7 +1196,10 @@ class MaspsxProcessor:
         elif op == "li":
             # TODO: handle non-soft floats?
             if self.expand_li:
-                res += expand_load_immediate(line)
+                res += expand_load_immediate(
+                    line,
+                    self.li_small_uses_addiu,
+                )
             else:
                 res.append(line)
 

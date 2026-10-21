@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import shlex
 import shutil
@@ -10,26 +10,45 @@ import time
 from typing import Optional
 
 ASPSX_RUNNER_LOOKUP = {
-    "1.05": "dosemu2",
-    "1.07": "dosemu2",
-    "2.05": "dosemu2",
-    "2.08": "dosemu2",
-    "2.21": "dosemu2",
-    "2.30": "dosemu2",
-    "2.34": "dosemu2",
-    "2.56": "wine",
-    "2.67": "wine",
-    "2.77": "wine",
-    "2.79": "wine",
-    "2.81": "wine",
-    "2.86": "wine",
+    "1.05": "daze",
+    "1.07": "daze",
+    "2.05": "daze",
+    "2.08": "daze",
+    "2.21": "daze",
+    "2.30": "daze",
+    "2.34": "daze",
+    "2.56": "wibo",
+    "2.67": "wibo",
+    "2.77": "wibo",
+    "2.79": "wibo",
+    "2.81": "wibo",
+    "2.86": "wibo",
 }
 
 DEFAULT_TIMEOUT = 30.0
 
+PSYQ_OBJ_PARSER = Path(__file__).parent / "binaries" / "psyq-obj-parser"
+
+DATA_SECTIONS = (".rdata", ".data", ".sdata", ".sbss", ".bss")
+
+# Symbol offsets keyed by symbol name. `.comm` symbols have no offset.
+SymbolOffsets = dict[str, Optional[int]]
+
+STT_SECTION = 3
+STT_FILE = 4
+
+# The instruction bits that each ELF relocation type fills in.
+RELOCATION_MASKS = {
+    2: 0xFFFFFFFF,  # R_MIPS_32
+    4: 0x03FFFFFF,  # R_MIPS_26
+    5: 0x0000FFFF,  # R_MIPS_HI16
+    6: 0x0000FFFF,  # R_MIPS_LO16
+    7: 0x0000FFFF,  # R_MIPS_GPREL16
+}
+
 
 class ObjectFormatError(ValueError):
-    """Raised when a PSYQ object does not contain a readable .text section."""
+    """Raised when a PSYQ object cannot be converted or read."""
 
 
 @dataclass
@@ -45,6 +64,7 @@ class RunResult:
     error: Optional[str] = None
     duration: float = 0.0
     failure_kind: Optional[str] = None
+    sections: dict[str, SymbolOffsets] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -83,76 +103,100 @@ def _text(data: bytes) -> str:
     return data.decode("utf-8", errors="replace")
 
 
-def _need(data: bytes, ptr: int, size: int, context: str) -> None:
-    if ptr + size > len(data):
+def convert_to_elf(
+    object_file: Path, elf_file: Path, timeout: float = DEFAULT_TIMEOUT
+) -> None:
+    """Convert a PSYQ object to ELF with psyq-obj-parser."""
+    try:
+        proc = subprocess.run(
+            [str(PSYQ_OBJ_PARSER), str(object_file), "-o", str(elf_file)],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
         raise ObjectFormatError(
-            f"truncated {context} at byte 0x{ptr:x} (needed {size} bytes)"
+            f"psyq-obj-parser exceeded timeout of {timeout:g}s"
+        ) from exc
+    if proc.returncode != 0 or not elf_file.exists():
+        # Errors go to stderr; stdout only has progress messages.
+        errors = [
+            line.strip().removeprefix("::").strip()
+            for line in _text(proc.stderr).splitlines()
+            if line.strip()
+        ]
+        raise ObjectFormatError(
+            f"psyq-obj-parser could not convert the object "
+            f"(exit code {proc.returncode}): {' / '.join(errors) or 'no output'}"
         )
 
 
-def read_text_section(data: bytes) -> bytes:
-    # Based on the PSYQ object format notes in pcsx-redux's psyq-obj-parser.
-    _need(data, 0, 4, "header")
-    if data[:3] != b"LNK":
-        raise ObjectFormatError("not a PSYQ object (missing LNK signature)")
-    if data[3] != 2:
-        raise ObjectFormatError(f"unknown PSYQ object version {data[3]}")
+def clear_relocated_fields(text: bytes, relocations: list[tuple[int, int]]) -> bytes:
+    """
+    Zero the instruction bits filled in by each `(offset, type)` relocation.
 
-    ptr = 4
-    sections: dict[int, str] = {}
-    current_section: Optional[str] = None
-    while ptr < len(data):
-        opcode_offset = ptr
-        opcode = data[ptr]
-        ptr += 1
-        if opcode == 46:  # PROGRAMTYPE
-            _need(data, ptr, 1, "PROGRAMTYPE")
-            ptr += 1
-        elif opcode == 16:  # SECTION
-            _need(data, ptr, 6, "SECTION header")
-            section_index = int.from_bytes(data[ptr : ptr + 2], "little")
-            ptr += 5  # index, group, alignment
-            string_length = data[ptr]
-            ptr += 1
-            _need(data, ptr, string_length, "SECTION name")
-            try:
-                section_name = data[ptr : ptr + string_length].decode("utf-8")
-            except UnicodeDecodeError as exc:
-                raise ObjectFormatError(
-                    f"invalid SECTION name at byte 0x{ptr:x}"
-                ) from exc
-            ptr += string_length
-            sections[section_index] = section_name
-        elif opcode == 6:  # SWITCH
-            _need(data, ptr, 2, "SWITCH")
-            section_index = int.from_bytes(data[ptr : ptr + 2], "little")
-            ptr += 2
-            if section_index not in sections:
-                raise ObjectFormatError(
-                    f"SWITCH references unknown section {section_index}"
-                )
-            current_section = sections[section_index]
-        elif opcode == 2:  # BYTES
-            _need(data, ptr, 2, "BYTES header")
-            size = int.from_bytes(data[ptr : ptr + 2], "little")
-            ptr += 2
-            _need(data, ptr, size, "BYTES payload")
-            payload = data[ptr : ptr + size]
-            ptr += size
-            if current_section == ".text":
-                return payload
-        elif opcode == 28:
-            _need(data, ptr, 3, "file record")
-            ptr += 2
-            string_length = data[ptr]
-            ptr += 1
-            _need(data, ptr, string_length, "file name")
-            ptr += string_length
-        else:
+    psyq-obj-parser stores relocation addends in the instructions, as ELF REL
+    relocations require. ASPSX leaves those bits zero and keeps the addend in
+    the relocation instead.
+    """
+    data = bytearray(text)
+    for offset, relocation_type in relocations:
+        mask = RELOCATION_MASKS.get(relocation_type)
+        if mask is None:
             raise ObjectFormatError(
-                f"unknown object opcode {opcode} at byte 0x{opcode_offset:x}"
+                f"unsupported relocation type {relocation_type} "
+                f"at .text offset 0x{offset:x}"
             )
-    raise ObjectFormatError("object did not contain a .text section")
+        if offset + 4 > len(data):
+            raise ObjectFormatError(
+                f"relocation at .text offset 0x{offset:x} is out of bounds"
+            )
+        word = int.from_bytes(data[offset : offset + 4], "little") & ~mask
+        data[offset : offset + 4] = word.to_bytes(4, "little")
+    return bytes(data)
+
+
+def read_text_section(elf_data: bytes) -> bytes:
+    """Return the .text section of an ELF object, as ASPSX emitted it."""
+    from spimdisasm.common import FileSectionType
+    from spimdisasm.elf32 import Elf32File
+
+    elf = Elf32File(elf_data)
+    text = elf.progbits.get(FileSectionType.Text)
+    if text is None:
+        return b""
+    rel = elf.rel.get(FileSectionType.Text)
+    relocations = [(r.offset, r.rType) for r in rel.relocations] if rel else []
+    return clear_relocated_fields(
+        elf_data[text.offset : text.offset + text.size], relocations
+    )
+
+
+def read_symbol_offsets(elf_data: bytes) -> dict[str, SymbolOffsets]:
+    """Return the offset of each symbol ASPSX placed in a data section."""
+    from spimdisasm.elf32 import Elf32File
+
+    elf = Elf32File(elf_data)
+    names = {
+        index: elf.shstrtab[header.name]
+        for index, header in enumerate(elf.sectionHeaders.sections)
+    }
+    sections: dict[str, SymbolOffsets] = {}
+    for symbol in elf.symtab.symbols:
+        name = elf.strtab[symbol.name]
+        section = names.get(symbol.shndx)
+        if not name or section not in DATA_SECTIONS:
+            continue
+        if symbol.info & 0xF in (STT_SECTION, STT_FILE):
+            continue
+        # The linker places `.comm` symbols, so their offsets come from
+        # psyq-obj-parser rather than ASPSX. They're the only data symbols
+        # with a size.
+        offset = None if symbol.size else symbol.value
+        sections.setdefault(section, {})[name] = offset
+    return sections
 
 
 def _words_from_text(text_data: bytes) -> list[str]:
@@ -176,13 +220,10 @@ def _build_command(
     extra_flags: str,
 ) -> list[str]:
     flags = [*shlex.split(data_limit), *shlex.split(extra_flags)]
-    if runner == "wine":
-        return ["wine", str(aspsx_path), *flags, "-o", object_name, source_name]
-    if runner == "dosemu2":
-        guest_command = shlex.join(
-            ["ASPSX.EXE", *flags, "-o", object_name, source_name]
-        )
-        return ["dosemu", "-dumb", "-K", str(workspace), "-E", guest_command]
+    if runner == "wibo":
+        return ["wibo", str(aspsx_path), *flags, "-o", object_name, source_name]
+    if runner == "daze":
+        return ["daze", "ASPSX.EXE", *flags, "-o", object_name, source_name]
     raise ValueError(f"unsupported ASPSX runner {runner!r}")
 
 
@@ -214,7 +255,7 @@ def run_aspsx_result(
         staged_source = workspace / source_asm.name
         try:
             shutil.copy2(source_asm, staged_source)
-            if runner == "dosemu2":
+            if runner == "daze":
                 shutil.copy2(aspsx_path, workspace / "ASPSX.EXE")
         except OSError as exc:
             return RunResult(
@@ -318,10 +359,18 @@ def run_aspsx_result(
             result.error = "assembler completed but did not create output.obj"
             result.failure_kind = "missing_output"
             return result
+        elf_file = workspace / "output.elf"
         try:
-            result.instructions = _words_from_text(
-                read_text_section(object_file.read_bytes())
-            )
+            convert_to_elf(object_file, elf_file, timeout)
+            elf_data = elf_file.read_bytes()
+            result.instructions = _words_from_text(read_text_section(elf_data))
+            result.sections = read_symbol_offsets(elf_data)
+        except FileNotFoundError as exc:
+            result.error = f"required host executable is unavailable: {exc.filename}"
+            result.failure_kind = "missing_tool"
+        except PermissionError as exc:
+            result.error = f"cannot execute required host executable: {exc}"
+            result.failure_kind = "permission_error"
         except (OSError, ObjectFormatError) as exc:
             result.error = str(exc)
             result.failure_kind = "parse_error"
@@ -390,7 +439,43 @@ def assembly_diff(expected: list[str], actual: list[str]) -> str:
     return "\n".join(lines)
 
 
-def assert_assembly_equal(testcase, expected: list[str], actual: list[str]) -> None:
-    """Assert words while retaining a useful assembly-level mismatch report."""
-    if expected != actual:
-        testcase.fail("assembly mismatch\n\n" + assembly_diff(expected, actual))
+def _symbol_differs(expected: SymbolOffsets, actual: SymbolOffsets, name: str) -> bool:
+    return name not in actual or expected[name] != actual[name]
+
+
+def _format_offset(offset: Optional[int]) -> str:
+    return "<comm>" if offset is None else f"0x{offset:X}"
+
+
+def symbol_diff(expected: SymbolOffsets, actual: SymbolOffsets) -> str:
+    """Format the expected symbols whose offsets differ, in section order."""
+    lines = [f"{'symbol':<24}{'expected':<12}actual"]
+    order = sorted(
+        expected, key=lambda name: (expected[name] is None, expected[name] or 0, name)
+    )
+    for name in order:
+        if _symbol_differs(expected, actual, name):
+            got = _format_offset(actual[name]) if name in actual else "<missing>"
+            lines.append(f"{name:<24}{_format_offset(expected[name]):<12}{got}")
+    return "\n".join(lines)
+
+
+def output_diff(
+    expected_text: Optional[list[str]],
+    expected_sections: dict[str, SymbolOffsets],
+    result: RunResult,
+) -> str:
+    """
+    Return a report for each expected section that differs, or "".
+
+    Only the sections and symbols listed in the fixture are checked.
+    """
+    reports = []
+    actual_text = result.instructions or []
+    if expected_text is not None and expected_text != actual_text:
+        reports.append(".text mismatch\n\n" + assembly_diff(expected_text, actual_text))
+    for section, expected in expected_sections.items():
+        actual = result.sections.get(section, {})
+        if any(_symbol_differs(expected, actual, name) for name in expected):
+            reports.append(f"{section} mismatch\n\n" + symbol_diff(expected, actual))
+    return "\n\n".join(reports)
