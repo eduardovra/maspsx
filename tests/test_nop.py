@@ -375,6 +375,28 @@ class TestNop(unittest.TestCase):
         clean_lines = strip_comments(res)
         self.assertEqual(expected_lines, clean_lines)
 
+    def test_load_block_end_label_move_nop(self):
+        """
+        load followed by move with a -gstabs lexical-block label in between
+        """
+        lines = [
+            "	lw	$3,0($2)",
+            "$L154:",
+            "$LBE11:",
+            "	move	$2,$3",
+        ]
+        expected_lines = [
+            "lw\t$3,0($2)",
+            "$L154:",
+            "nop",
+            "$LBE11:",
+            "addu\t$2,$3,$zero",
+        ]
+        mp = MaspsxProcessor(lines)
+        res = mp.process_lines()
+        clean_lines = strip_comments(res)
+        self.assertEqual(expected_lines, clean_lines)
+
     def test_div_move_nop(self):
         """
         div followed by move with label in between
