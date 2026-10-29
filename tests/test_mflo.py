@@ -335,3 +335,22 @@ class TestMflo(unittest.TestCase):
 
         clean_lines = strip_comments(res)
         self.assertEqual(expected_lines, clean_lines)
+
+    def test_mfhi_stack_load_then_mult(self):
+        lines = [
+            "	mfhi	$4",
+            "	#nop",
+            "	lw	$31,20($sp)",
+            "	mult	$2,$3",
+        ]
+        expected_lines = [
+            "mfhi\t$4",
+            "lw\t$31,20($sp)",
+            "nop",
+            "mult\t$2,$3",
+        ]
+        mp = MaspsxProcessor(lines)
+        res = mp.process_lines()
+
+        clean_lines = strip_comments(res)
+        self.assertEqual(expected_lines, clean_lines)

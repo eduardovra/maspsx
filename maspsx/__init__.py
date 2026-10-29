@@ -854,7 +854,7 @@ class MaspsxProcessor:
                 skip += 1
                 if inst == next_instruction:
                     op, *_ = inst.strip().split()
-                    if op in load_mnemonics:
+                    if op in load_mnemonics and uses_at(inst):
                         # allow for $at handling later in the script
                         skip = 0
                         break
